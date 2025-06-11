@@ -132,7 +132,23 @@
         updateVisibleSegments();
       });
 
-    map.on('moveend zoomend', debounce(updateVisibleSegments, 300)); // buvo 100
+// Debounce funkcija (naudojama globaliai)
+function debounce(func, wait) {
+  let timeout;
+  return function() {
+    const context = this, args = arguments;
+    clearTimeout(timeout);
+    timeout = setTimeout(function() {
+      func.apply(context, args);
+    }, wait);
+  };
+}
+
+// Sukuriam debounced versiją VIENĄ KARTĄ
+const debouncedUpdateVisibleSegments = debounce(updateVisibleSegments, 350);
+
+// Pakeičiam eventus, kad naudotų debounced funkciją
+map.on('moveend zoomend', debouncedUpdateVisibleSegments);
 
     function updateVisibleSegments() {
   if (!isDataLoaded) return;
@@ -143,24 +159,18 @@
     nodeHash = {};
     edges = [];
     neighbors = {};
-    // Do NOT remove the green route line here!
-    // if (lineLayer) map.removeLayer(lineLayer);
-    // lineLayer = null;
     document.getElementById('distance').textContent = "Priartinkite žemėlapį (zoom 11+) kad matytumėte upes.";
-    // Always show the last calculated route if it exists
     if (lastRouteGeoJson) {
       showSavedRoute();
     }
     return;
   }
 
-  // Pridėta: expandedBounds logika
+  // expandedBounds ir segmentsToUse logika
   let expandedBounds = null;
   let segmentsToUse;
   if (points.length === 2) {
-    // Jei pažymėti du taškai, naudoti VISUS segmentus grafui
     segmentsToUse = allSegments;
-    // Bet vizualizacijai rodyti tik matomus/aktualius
     let lngs = [points[0][0], points[1][0]];
     let lats = [points[0][1], points[1][1]];
     let minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
@@ -170,7 +180,6 @@
     minLng -= buffer; maxLng += buffer; minLat -= buffer; maxLat += buffer;
     expandedBounds = [[minLat, minLng], [maxLat, maxLng]];
   } else {
-    // Jei nepažymėti du taškai, naudoti tik matomus segmentus
     segmentsToUse = allSegments.filter(seg => {
       return seg.geometry.coordinates.some(function(coord) {
         var latlng = L.latLng(coord[1], coord[0]);
@@ -179,26 +188,7 @@
     });
   }
 
-  // Vizualizacijai rodom tik matomus/aktualius segmentus
-  var visible = allSegments.filter(seg => {
-    if (expandedBounds) {
-      return seg.geometry.coordinates.some(coord =>
-        coord[0] >= expandedBounds[0][1] && coord[0] <= expandedBounds[1][1] &&
-        coord[1] >= expandedBounds[0][0] && coord[1] <= expandedBounds[1][0]
-      );
-    } else {
-      return seg.geometry.coordinates.some(function(coord) {
-        var latlng = L.latLng(coord[1], coord[0]);
-        return map.getBounds().contains(latlng);
-      });
-    }
-  });
-
-  // Atvaizduojame segmentus žemėlapyje
-  if (currentLayer) map.removeLayer(currentLayer);
-  currentLayer = L.geoJSON({type: "FeatureCollection", features: visible}, {style: {color: "#42A5F5", weight: 2}}).addTo(map);
-
-  // Sudarom grafą iš segmentsToUse
+  // Grafas SUDAROMAS IŠKART iš visų segmentsToUse
   nodeCoords = [];
   nodeHash = {};
   edges = [];
@@ -218,93 +208,112 @@
       neighbors[idxB].push({to: idxA, dist: length});
     }
   });
-
-  // Build segment direction index for direction analysis
   segmentDirectionIndex = buildSegmentDirectionIndex(segmentsToUse);
 
   // Pažymėtus taškus vis tiek įtraukiame, jei nėra grafe!
-      for (let pi = 0; pi < points.length; pi++) {
-        let p = points[pi];
-        // Ar nodeCoords jau turi šį tašką?
-        let inGraph = false;
-        for (let i = 0; i < nodeCoords.length; i++) {
-          if (coordsEqual(p, nodeCoords[i])) { inGraph = true; break; }
+  for (let pi = 0; pi < points.length; pi++) {
+    let p = points[pi];
+    let inGraph = false;
+    for (let i = 0; i < nodeCoords.length; i++) {
+      if (coordsEqual(p, nodeCoords[i])) { inGraph = true; break; }
+    }
+    if (!inGraph) {
+      let nearestSeg = null, nearestPoint = null, minDist = Infinity;
+      allSegments.forEach(seg => {
+        seg.geometry.coordinates.forEach(coord => {
+          let d = turf.distance(turf.point(p), turf.point(coord), {units:'kilometers'});
+          if (d < minDist) {
+            minDist = d;
+            nearestSeg = seg;
+            nearestPoint = coord;
+          }
+        });
+      });
+      if (nearestSeg) {
+        let coords = nearestSeg.geometry.coordinates;
+        for (let i = 0; i < coords.length - 1; i++) {
+          let a = coords[i], b = coords[i+1];
+          let idxA = findOrCreateNode(a);
+          let idxB = findOrCreateNode(b);
+          let length = turf.distance(turf.point(a), turf.point(b), {units:'kilometers'});
+          edges.push({from: idxA, to: idxB, dist: length});
+          edges.push({from: idxB, to: idxA, dist: length});
+          if (!neighbors[idxA]) neighbors[idxA] = [];
+          if (!neighbors[idxB]) neighbors[idxB] = [];
+          neighbors[idxA].push({to: idxB, dist: length});
+          neighbors[idxB].push({to: idxA, dist: length});
         }
-        if (!inGraph) {
-          // Artimiausias segmentas tarp visų ALL SEGMENTS
-          let nearestSeg = null, nearestPoint = null, minDist = Infinity;
-          allSegments.forEach(seg => {
-            seg.geometry.coordinates.forEach(coord => {
-              let d = turf.distance(turf.point(p), turf.point(coord), {units:'kilometers'});
-              if (d < minDist) {
-                minDist = d;
-                nearestSeg = seg;
-                nearestPoint = coord;
-              }
-            });
-          });
-          // Įtraukiam VISĄ segmentą
-          if (nearestSeg) {
-            let coords = nearestSeg.geometry.coordinates;
-            for (let i = 0; i < coords.length - 1; i++) {
-              let a = coords[i], b = coords[i+1];
-              let idxA = findOrCreateNode(a);
-              let idxB = findOrCreateNode(b);
-              let length = turf.distance(turf.point(a), turf.point(b), {units:'kilometers'});
-              edges.push({from: idxA, to: idxB, dist: length});
-              edges.push({from: idxB, to: idxA, dist: length});
-              // Taip pat neighbors papildyti ir pažymėtų taškų įtraukimo vietoje:
-              if (!neighbors[idxA]) neighbors[idxA] = [];
-              if (!neighbors[idxB]) neighbors[idxB] = [];
-              neighbors[idxA].push({to: idxB, dist: length});
-              neighbors[idxB].push({to: idxA, dist: length});
-            }
-            // Svarbiausia – sujungiam pažymėtą tašką su artimiausiu segmento tašku!
-            let customIdx = findOrCreateNode(p);
-            let nearestIdxInSegment = -1, minSegmentDist = Infinity, nearestCoord = null;
-            for (let i = 0; i < coords.length; i++) {
-              let d = turf.distance(turf.point(p), turf.point(coords[i]), {units:'kilometers'});
-              if (d < minSegmentDist) {
-                minSegmentDist = d;
-                nearestIdxInSegment = findOrCreateNode(coords[i]);
-                nearestCoord = coords[i];
-              }
-            }
-            let distToSegment = turf.distance(turf.point(p), turf.point(nearestCoord), {units:'kilometers'});
-            edges.push({from: customIdx, to: nearestIdxInSegment, dist: distToSegment});
-            edges.push({from: nearestIdxInSegment, to: customIdx, dist: distToSegment});
-            if (!neighbors[customIdx]) neighbors[customIdx] = [];
-            if (!neighbors[nearestIdxInSegment]) neighbors[nearestIdxInSegment] = [];
-            neighbors[customIdx].push({to: nearestIdxInSegment, dist: distToSegment});
-            neighbors[nearestIdxInSegment].push({to: customIdx, dist: distToSegment});
+        let customIdx = findOrCreateNode(p);
+        let nearestIdxInSegment = -1, minSegmentDist = Infinity, nearestCoord = null;
+        for (let i = 0; i < coords.length; i++) {
+          let d = turf.distance(turf.point(p), turf.point(coords[i]), {units:'kilometers'});
+          if (d < minSegmentDist) {
+            minSegmentDist = d;
+            nearestIdxInSegment = findOrCreateNode(coords[i]);
+            nearestCoord = coords[i];
           }
         }
-      }
-
-      // Jei buvo paskaičiuotas maršrutas – perpiešk jį
-      if (lastRouteGeoJson) {
-        showSavedRoute();
-      }
-
-      // Jei laukiamas maršruto skaičiavimas (pendingRoute)
-      if (pendingRoute && nodeCoords.length > 0) {
-        // Rodyti spinnerį tik jei pažymėti du taškai
-        if (points.length === 2) {
-          showSpinner();
-          setTimeout(function() {
-            var fromIdx = getNearestNodeIdx(pendingRoute[0]);
-            var toIdx = getNearestNodeIdx(pendingRoute[1]);
-            findRiverPath(fromIdx, toIdx);
-            pendingRoute = null;
-          }, 10);
-        } else {
-          var fromIdx = getNearestNodeIdx(pendingRoute[0]);
-          var toIdx = getNearestNodeIdx(pendingRoute[1]);
-          findRiverPath(fromIdx, toIdx);
-          pendingRoute = null;
-        }
+        let distToSegment = turf.distance(turf.point(p), turf.point(nearestCoord), {units:'kilometers'});
+        edges.push({from: customIdx, to: nearestIdxInSegment, dist: distToSegment});
+        edges.push({from: nearestIdxInSegment, to: customIdx, dist: distToSegment});
+        if (!neighbors[customIdx]) neighbors[customIdx] = [];
+        if (!neighbors[nearestIdxInSegment]) neighbors[nearestIdxInSegment] = [];
+        neighbors[customIdx].push({to: nearestIdxInSegment, dist: distToSegment});
+        neighbors[nearestIdxInSegment].push({to: customIdx, dist: distToSegment});
       }
     }
+  }
+
+  // Vizualizacija – etapais
+  var segs = (expandedBounds ? allSegments : segmentsToUse).map(seg => {
+    let coords = seg.geometry.coordinates;
+    let len = 0;
+    for (let i = 0; i < coords.length - 1; i++) {
+      len += turf.distance(turf.point(coords[i]), turf.point(coords[i+1]), {units:'kilometers'});
+    }
+    return {seg, len};
+  });
+  var longSegs = segs.filter(s => s.len > 2).map(s => s.seg);
+  var midSegs = segs.filter(s => s.len > 0.5 && s.len <= 2).map(s => s.seg);
+  var shortSegs = segs.filter(s => s.len <= 0.5).map(s => s.seg);
+
+  if (currentLayer) map.removeLayer(currentLayer);
+  currentLayer = L.geoJSON({type: "FeatureCollection", features: longSegs}, {style: {color: "#42A5F5", weight: 2}}).addTo(map);
+  if (lastRouteGeoJson) showSavedRoute();
+  setTimeout(function() {
+    if (currentLayer) map.removeLayer(currentLayer);
+    currentLayer = L.geoJSON({type: "FeatureCollection", features: longSegs.concat(midSegs)}, {style: {color: "#42A5F5", weight: 2}}).addTo(map);
+    if (lastRouteGeoJson) showSavedRoute();
+  }, 150);
+  setTimeout(function() {
+    if (currentLayer) map.removeLayer(currentLayer);
+    currentLayer = L.geoJSON({type: "FeatureCollection", features: longSegs.concat(midSegs, shortSegs)}, {style: {color: "#42A5F5", weight: 2}}).addTo(map);
+    if (lastRouteGeoJson) showSavedRoute();
+  }, 300);
+
+  // Jei buvo paskaičiuotas maršrutas – perpiešk jį
+  if (lastRouteGeoJson) {
+    showSavedRoute();
+  }
+
+  // Jei laukiamas maršruto skaičiavimas (pendingRoute)
+  if (pendingRoute && nodeCoords.length > 0) {
+    if (points.length === 2) {
+      showSpinner();
+      setTimeout(function() {
+        var fromIdx = getNearestNodeIdx(pendingRoute[0]);
+        var toIdx = getNearestNodeIdx(pendingRoute[1]);
+        findRiverPath(fromIdx, toIdx);
+        pendingRoute = null;
+      }, 10);
+    } else {
+      var fromIdx = getNearestNodeIdx(pendingRoute[0]);
+      var toIdx = getNearestNodeIdx(pendingRoute[1]);
+      findRiverPath(fromIdx, toIdx);
+      pendingRoute = null;
+    }
+  }
+}
 
     function debounce(func, wait) {
       let timeout;
